@@ -6,7 +6,10 @@ entries that lost their last placement, and record report metadata.  Any
 failure rolls back everything, leaving both the data and the roster intact.
 
 Concurrent replacements pass a FIFO gate before entering their transaction,
-so they take effect strictly in submission order.
+so they take effect strictly in submission order.  Validation happens inside
+the turn, against the data committed by every earlier submission: a report
+queued behind a pending first upload is judged against the state that first
+upload leaves behind, not against the state at arrival time.
 """
 
 from __future__ import annotations
@@ -56,6 +59,11 @@ class OrderGate:
     def turn(self, ticket: int) -> Iterator[None]:
         with self._cond:
             while self._serving != ticket:
+                if ticket < self._serving:
+                    # The ticket was released behind our back (e.g. the
+                    # caller gave up waiting and skipped it); a skipped turn
+                    # must never run, or later submissions would be reordered.
+                    raise ReportError("该次提交已不在队列中，请重新上传")
                 self._cond.wait()
         try:
             yield
@@ -191,6 +199,12 @@ class ReportService:
         are required.  Afterwards the configuration is immutable and either
         file may be omitted, in which case its current table is kept.
 
+        Whether a submission *is* the first upload is decided at its turn,
+        against the data committed by every earlier submission — a single
+        table queued behind a pending first upload becomes a replacement as
+        soon as that first upload commits, and is rejected only if the store
+        is still empty when its turn comes.
+
         ``ticket`` lets an async caller fix the submission order before any
         ``await`` (in particular before reading a request body); it must come
         from :meth:`OrderGate.ticket`.
@@ -201,43 +215,43 @@ class ReportService:
 
         ticket = self.gate.ticket() if ticket is None else ticket
         try:
-            # Parse and validate both files *before* taking a turn, so a bad
-            # file never blocks healthy concurrent submissions.
-            config = self.get_config()
-            pending = _Pending()
-            if config is None:
-                if placements_raw is None or doses_raw is None:
-                    raise ReportError(
-                        "首次上传需同时提交摆放表和剂量表，并填写照度上限与剂量阈值"
-                    )
-                if illuminance_cap is None or dose_threshold is None:
-                    raise ReportError(
-                        "首次上传需填写照度上限（勒克斯）与展品剂量阈值"
-                    )
-                pending.new_config = _validate_config(
-                    illuminance_cap, dose_threshold
-                )
-                # Validate the dose file against the cap supplied *with this
-                # first upload*; a concurrent upload cannot create a different
-                # configuration without conflicting later in ``_apply``.
-                effective = pending.new_config
-            else:
-                requested = _requested_config(illuminance_cap, dose_threshold)
-                if requested is not None and not _same_config(requested, config):
-                    raise ReportError(
-                        "照度上限与剂量阈值已在首次上传时确定，后续换报不可更改"
-                    )
-                effective = config
-
-            if placements_raw is not None:
-                pending.placements = parse_placements(placements_raw)
-                pending.placements_name = placements_name or "placements.csv"
-            if doses_raw is not None:
-                pending.doses = parse_doses(doses_raw, effective.illuminance_cap)
-                pending.doses_name = doses_name or "doses.csv"
-
-            result = SubmitResult(ticket=ticket, replaced=_replaced_kinds(pending))
             with self.gate.turn(ticket):
+                # Inside the turn the committed state cannot change (every
+                # writer passes this gate), so validate and parse against
+                # exactly the data earlier submissions left behind.
+                config = self.get_config()
+                pending = _Pending()
+                if config is None:
+                    if placements_raw is None or doses_raw is None:
+                        raise ReportError(
+                            "首次上传需同时提交摆放表和剂量表，并填写照度上限与剂量阈值"
+                        )
+                    if illuminance_cap is None or dose_threshold is None:
+                        raise ReportError(
+                            "首次上传需填写照度上限（勒克斯）与展品剂量阈值"
+                        )
+                    pending.new_config = _validate_config(
+                        illuminance_cap, dose_threshold
+                    )
+                    # Validate the dose file against the cap supplied *with
+                    # this first upload*.
+                    effective = pending.new_config
+                else:
+                    requested = _requested_config(illuminance_cap, dose_threshold)
+                    if requested is not None and not _same_config(requested, config):
+                        raise ReportError(
+                            "照度上限与剂量阈值已在首次上传时确定，后续换报不可更改"
+                        )
+                    effective = config
+
+                if placements_raw is not None:
+                    pending.placements = parse_placements(placements_raw)
+                    pending.placements_name = placements_name or "placements.csv"
+                if doses_raw is not None:
+                    pending.doses = parse_doses(doses_raw, effective.illuminance_cap)
+                    pending.doses_name = doses_name or "doses.csv"
+
+                result = SubmitResult(ticket=ticket, replaced=_replaced_kinds(pending))
                 with self.store.transaction() as conn:
                     _apply(conn, result, pending)
             return result
@@ -269,8 +283,9 @@ def _replaced_kinds(pending: _Pending) -> list[str]:
 def _apply(
     conn: sqlite3.Connection, result: SubmitResult, pending: _Pending
 ) -> None:
-    # A concurrent first upload may have created the configuration between our
-    # pre-validation and this turn; re-read it under the write transaction.
+    # Validation already ran inside this submission's turn, so the stored
+    # configuration cannot have changed since; re-read it here as a
+    # defensive invariant before writing anything.
     config = _read_config(conn)
     if config is None:
         if pending.new_config is None:
@@ -282,7 +297,7 @@ def _apply(
     elif pending.new_config is not None and not _same_config(
         pending.new_config, config
     ):
-        # Another upload won the race and fixed the configuration first.
+        # Unreachable while every writer passes the gate; kept as a guard.
         raise ReportError(
             "照度上限与剂量阈值已在首次上传时确定，后续换报不可更改"
         )

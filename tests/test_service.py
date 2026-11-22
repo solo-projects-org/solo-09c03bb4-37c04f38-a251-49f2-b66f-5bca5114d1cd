@@ -3,8 +3,11 @@ concurrency ordering, and the web surface."""
 
 from __future__ import annotations
 
+import asyncio
 import threading
+import time
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -418,3 +421,377 @@ def test_web_samples_download(client):
     response = c.get("/samples/placements.csv")
     assert response.status_code == 200
     assert response.content.startswith(b"\xef\xbb\xbfexhibit_id")
+
+
+# ---------------------------------------------------- queued first upload
+def _stall_parse_placements(monkeypatch):
+    """Block placement parsing until released, simulating a slow first upload."""
+
+    import app.service as service_module
+
+    real_parse = service_module.parse_placements
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_parse(raw):
+        entered.set()
+        assert release.wait(timeout=30)
+        return real_parse(raw)
+
+    monkeypatch.setattr(service_module, "parse_placements", slow_parse)
+    return entered, release
+
+
+def _stall_parse_doses(monkeypatch):
+    """Block dose parsing until released, simulating a slow replacement."""
+
+    import app.service as service_module
+
+    real_parse = service_module.parse_doses
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_parse(raw, cap):
+        entered.set()
+        assert release.wait(timeout=30)
+        return real_parse(raw, cap)
+
+    monkeypatch.setattr(service_module, "parse_doses", slow_parse)
+    return entered, release
+
+
+def _wait_event(event: threading.Event) -> None:
+    assert event.wait(timeout=10), "timed out waiting for the submission to reach parsing"
+
+
+async def _wait_event_async(event: threading.Event) -> None:
+    for _ in range(1000):
+        if event.is_set():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("timed out waiting for the submission to reach parsing")
+
+
+def test_single_table_waits_for_pending_first_report(tmp_path, monkeypatch):
+    """首报还没入库时紧随的单表换报：首报成功后按换报生效，不得误当首报退回。"""
+
+    store = Store(tmp_path / "queued.sqlite3")
+    store.init_schema()
+    svc = ReportService(store)
+    entered, release = _stall_parse_placements(monkeypatch)
+
+    p = placements_csv(("E1", "C1", "2026-05-01T09:00Z", "2026-05-01T10:00Z"))
+    first_ticket = svc.gate.ticket()
+    second_ticket = svc.gate.ticket()
+
+    def run_first():
+        svc.submit(
+            placements_raw=p, placements_name="p.csv",
+            doses_raw=doses_csv(("C1", "2026-05-01T09:00Z", 500)),
+            doses_name="d.csv",
+            illuminance_cap=10.0, dose_threshold=400.0,
+            ticket=first_ticket,
+        )
+
+    first = threading.Thread(target=run_first)
+    first.start()
+    _wait_event(entered)  # 首报已轮到、尚未入库
+
+    second_errors: list[Exception] = []
+    second_result: dict[str, object] = {}
+
+    def run_second():
+        try:
+            second_result["result"] = svc.submit(
+                placements_raw=None, placements_name=None,
+                doses_raw=doses_csv(("C1", "2026-05-01T09:00Z", 550)),
+                doses_name="d2.csv",
+                illuminance_cap=None, dose_threshold=None,
+                ticket=second_ticket,
+            )
+        except ReportError as exc:
+            second_errors.append(exc)
+
+    second = threading.Thread(target=run_second)
+    second.start()
+    time.sleep(0.2)
+    # 旧行为：单表被误当首报立即退回；修复后应排队等首报落库。
+    assert second.is_alive() and not second_errors
+    release.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert not second_errors
+    assert svc.initialized()
+    config = svc.get_config()
+    assert (config.illuminance_cap, config.dose_threshold) == (10.0, 400.0)
+    # 单表换报沿用生效的照度上限、剂量阈值和库中的摆放表。
+    assessment = svc.get_assessment("E1")
+    assert assessment["dose_low"] == 550.0
+    assert assessment["status"] == "over"
+    meta = svc.report_meta()
+    assert meta["placements"]["source_name"] == "p.csv"
+    assert meta["doses"]["source_name"] == "d2.csv"
+
+
+def test_single_table_rejected_when_pending_first_report_fails(
+    tmp_path, monkeypatch
+):
+    """首报失败、库仍为空时，排队的单表退回；后续合规的完整首报可以建库。"""
+
+    store = Store(tmp_path / "queued-fail.sqlite3")
+    store.init_schema()
+    svc = ReportService(store)
+    entered, release = _stall_parse_placements(monkeypatch)
+
+    p = placements_csv(("E1", "C1", "2026-05-01T09:00Z", "2026-05-01T10:00Z"))
+    first_ticket = svc.gate.ticket()
+    second_ticket = svc.gate.ticket()
+    first_errors: list[Exception] = []
+
+    def run_first():
+        try:
+            svc.submit(
+                placements_raw=p, placements_name="p.csv",
+                doses_raw=doses_csv(("C1", "2026-05-01T09:00Z", -5)),  # 负剂量
+                doses_name="bad.csv",
+                illuminance_cap=10.0, dose_threshold=400.0,
+                ticket=first_ticket,
+            )
+        except ReportError as exc:
+            first_errors.append(exc)
+
+    first = threading.Thread(target=run_first)
+    first.start()
+    _wait_event(entered)
+
+    second_errors: list[Exception] = []
+
+    def run_second():
+        try:
+            svc.submit(
+                placements_raw=None, placements_name=None,
+                doses_raw=doses_csv(("C1", "2026-05-01T09:00Z", 550)),
+                doses_name="d2.csv",
+                illuminance_cap=None, dose_threshold=None,
+                ticket=second_ticket,
+            )
+        except ReportError as exc:
+            second_errors.append(exc)
+
+    second = threading.Thread(target=run_second)
+    second.start()
+    time.sleep(0.2)
+    assert second.is_alive()  # 排队等首报的结论，而不是抢先判定
+    release.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert len(first_errors) == 1  # 首报整表退回
+    assert len(second_errors) == 1
+    assert "首次上传" in str(second_errors[0])  # 库仍为空，单表退回
+    assert not svc.initialized()
+
+    # 后续合规的完整首报可以建库。
+    svc.submit(
+        placements_raw=p, placements_name="p.csv",
+        doses_raw=doses_csv(("C1", "2026-05-01T09:00Z", 500)),
+        doses_name="d.csv",
+        illuminance_cap=10.0, dose_threshold=400.0,
+    )
+    assert svc.initialized()
+    assert svc.get_assessment("E1")["status"] == "over"
+
+
+# ------------------------------------------------------- web queue surface
+def test_web_single_table_behind_pending_first_report(tmp_path, monkeypatch):
+    """网页：首报还在入库，紧随的单表换报排队生效，不再被误当首报退回。"""
+
+    entered, release = _stall_parse_placements(monkeypatch)
+    app = create_app(str(tmp_path / "web-first.sqlite3"))
+    p = placements_csv(("E1", "C1", "2026-05-01T09:00Z", "2026-05-01T10:00Z"))
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as c:
+            first = asyncio.create_task(
+                c.post(
+                    "/submit",
+                    files={
+                        "placements": ("p.csv", p, "text/csv"),
+                        "doses": (
+                            "d.csv",
+                            doses_csv(("C1", "2026-05-01T09:00Z", 500)),
+                            "text/csv",
+                        ),
+                    },
+                    data={"illuminance_cap": "10", "dose_threshold": "400"},
+                    follow_redirects=False,
+                )
+            )
+            await _wait_event_async(entered)  # 首报已轮到、尚未入库
+            second = asyncio.create_task(
+                c.post(
+                    "/submit",
+                    files={
+                        "doses": (
+                            "d2.csv",
+                            doses_csv(("C1", "2026-05-01T09:00Z", 550)),
+                            "text/csv",
+                        )
+                    },
+                    follow_redirects=False,
+                )
+            )
+            await asyncio.sleep(0.3)
+            assert not second.done()  # 在排队，而不是被退回
+            release.set()
+            first_response, second_response = await asyncio.gather(first, second)
+            assert first_response.status_code == 303, first_response.text
+            assert second_response.status_code == 303, second_response.text
+            page = await c.get("/")
+            assert "E1" in page.text
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        app.state.submit_executor.shutdown(wait=True)
+
+    svc = app.state.service
+    assert svc.get_assessment("E1")["dose_low"] == 550.0
+    assert svc.report_meta()["doses"]["source_name"] == "d2.csv"
+
+
+def test_web_single_table_rejected_after_failed_first_report(
+    tmp_path, monkeypatch
+):
+    """网页：首报失败、库仍为空时单表退回；随后合规的完整首报建库。"""
+
+    entered, release = _stall_parse_placements(monkeypatch)
+    app = create_app(str(tmp_path / "web-first-fail.sqlite3"))
+    p = placements_csv(("E1", "C1", "2026-05-01T09:00Z", "2026-05-01T10:00Z"))
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as c:
+            first = asyncio.create_task(
+                c.post(
+                    "/submit",
+                    files={
+                        "placements": ("p.csv", p, "text/csv"),
+                        "doses": (
+                            "bad.csv",
+                            doses_csv(("C1", "2026-05-01T09:00Z", -5)),
+                            "text/csv",
+                        ),
+                    },
+                    data={"illuminance_cap": "10", "dose_threshold": "400"},
+                    follow_redirects=False,
+                )
+            )
+            await _wait_event_async(entered)
+            second = asyncio.create_task(
+                c.post(
+                    "/submit",
+                    files={
+                        "doses": (
+                            "d2.csv",
+                            doses_csv(("C1", "2026-05-01T09:00Z", 550)),
+                            "text/csv",
+                        )
+                    },
+                    follow_redirects=False,
+                )
+            )
+            await asyncio.sleep(0.3)
+            assert not second.done()
+            release.set()
+            first_response, second_response = await asyncio.gather(first, second)
+            assert first_response.status_code == 400
+            assert second_response.status_code == 400
+            assert "首次上传" in second_response.text
+            assert "换报未生效" in second_response.text
+
+            # 库仍为空：随后合规的完整首报可以建库。
+            third = await c.post(
+                "/submit",
+                files={
+                    "placements": ("p.csv", p, "text/csv"),
+                    "doses": (
+                        "d.csv",
+                        doses_csv(("C1", "2026-05-01T09:00Z", 500)),
+                        "text/csv",
+                    ),
+                },
+                data={"illuminance_cap": "10", "dose_threshold": "400"},
+                follow_redirects=False,
+            )
+            assert third.status_code == 303, third.text
+            page = await c.get("/")
+            assert "E1" in page.text
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        app.state.submit_executor.shutdown(wait=True)
+
+    svc = app.state.service
+    assert svc.initialized()
+    assert svc.get_assessment("E1")["status"] == "over"
+
+
+def test_web_roster_readable_while_replacements_queue(tmp_path, monkeypatch):
+    """多份换报排队等入库时，名单页仍能打开并读到已发布的结果。"""
+
+    app = create_app(str(tmp_path / "web-queue.sqlite3"))
+    svc = app.state.service
+    svc.submit(
+        placements_raw=placements_csv(
+            ("E1", "C1", "2026-05-01T09:00Z", "2026-05-01T10:00Z")
+        ),
+        placements_name="p.csv",
+        doses_raw=doses_csv(("C1", "2026-05-01T09:00Z", 500)),
+        doses_name="d.csv",
+        illuminance_cap=10.0,
+        dose_threshold=400.0,
+    )
+    entered, release = _stall_parse_doses(monkeypatch)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as c:
+            payload = doses_csv(("C1", "2026-05-01T09:00Z", 520))
+            posts = [
+                asyncio.create_task(
+                    c.post(
+                        "/submit",
+                        files={"doses": ("new.csv", payload, "text/csv")},
+                        follow_redirects=False,
+                    )
+                )
+                for _ in range(50)
+            ]
+            await _wait_event_async(entered)  # 第一份在解析，其余排在闸门后
+            # 排队期间名单页必须可读，且读到的是已发布的结果。
+            page = await asyncio.wait_for(c.get("/"), timeout=5)
+            assert page.status_code == 200
+            assert "E1" in page.text
+            assert "确定超限" in page.text
+            detail = await asyncio.wait_for(c.get("/exhibits/E1"), timeout=5)
+            assert detail.status_code == 200
+            release.set()
+            responses = await asyncio.gather(*posts)
+            assert all(r.status_code == 303 for r in responses)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        app.state.submit_executor.shutdown(wait=True)
+
+    assert svc.get_assessment("E1")["dose_low"] == 520.0

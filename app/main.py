@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import os
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
 
@@ -10,7 +14,6 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from starlette.concurrency import run_in_threadpool
 
 from . import assess
 from .csvio import sample_doses_csv, sample_placements_csv
@@ -30,10 +33,23 @@ def create_app(db_path: str | None = None) -> FastAPI:
     store.init_schema()
     service = ReportService(store)
 
-    app = FastAPI(title="展柜照度剂量复核")
+    # Queued submissions block on the order gate while waiting for their
+    # turn.  Keep them on a dedicated executor so they can never occupy
+    # every shared thread and starve the roster pages.
+    submit_executor = ThreadPoolExecutor(
+        max_workers=4, thread_name_prefix="submit"
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        submit_executor.shutdown(wait=True)
+
+    app = FastAPI(title="展柜照度剂量复核", lifespan=lifespan)
     app.state.store = store
     app.state.service = service
     app.state.db_path = path
+    app.state.submit_executor = submit_executor
 
     templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
     templates.env.filters["minute"] = format_minute
@@ -63,28 +79,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
         illuminance_cap: str = Form(""),
         dose_threshold: str = Form(""),
     ):
-        # Fix the arrival order before the first await, so concurrent
-        # submissions are applied in the sequence they reached the server.
-        ticket = service.gate.ticket()
-        handed_over = False
         try:
             cap = _optional_float(illuminance_cap, "照度上限")
             threshold = _optional_float(dose_threshold, "剂量阈值")
             placements_raw, placements_name = await _read_upload(placements)
             doses_raw, doses_name = await _read_upload(doses)
-            handed_over = True
-            # The submission blocks on the order gate and on SQLite, so run it
-            # in a worker thread instead of stalling the event loop.
-            result = await run_in_threadpool(
-                service.submit,
-                placements_raw=placements_raw,
-                placements_name=placements_name,
-                doses_raw=doses_raw,
-                doses_name=doses_name,
-                illuminance_cap=cap,
-                dose_threshold=threshold,
-                ticket=ticket,
-            )
         except ReportError as exc:
             return _error_page(request, templates, service, exc.messages,
                                illuminance_cap, dose_threshold)
@@ -94,9 +93,37 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 ["CSV 编码无法识别，请另存为 UTF-8 后重试"],
                 illuminance_cap, dose_threshold,
             )
-        finally:
-            if not handed_over:
-                service.gate.skip(ticket)
+
+        # Take the queue ticket only once the whole form has arrived, so
+        # replacements take effect in the order the service received their
+        # complete forms — not in the order connections happened to open.
+        ticket = service.gate.ticket()
+        try:
+            # The submission blocks on the order gate and on SQLite; run it
+            # on the dedicated executor so queued reports never stall the
+            # roster pages.
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                submit_executor,
+                functools.partial(
+                    service.submit,
+                    placements_raw=placements_raw,
+                    placements_name=placements_name,
+                    doses_raw=doses_raw,
+                    doses_name=doses_name,
+                    illuminance_cap=cap,
+                    dose_threshold=threshold,
+                    ticket=ticket,
+                ),
+            )
+        except ReportError as exc:
+            return _error_page(request, templates, service, exc.messages,
+                               illuminance_cap, dose_threshold)
+        except BaseException:
+            # service.submit releases its own ticket on failure; this covers
+            # the executor never getting to run it at all.
+            service.gate.skip(ticket)
+            raise
 
         labels = {"placements": "摆放表", "doses": "剂量表"}
         detail = "、".join(labels[kind] for kind in result.replaced)
